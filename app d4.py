@@ -309,7 +309,7 @@ def parse_pdf_content(uploaded):
                     # table is a list of rows (lists); convert to DataFrame
                     df = pd.DataFrame(table)
                     # Replace None with empty string and clean each cell
-                    df = df.fillna('').astype(str).applymap(clean_text)
+                    df = df.fillna('').astype(str).map(clean_text)
                     dfs.append(df)
     except Exception:
         # If pdfplumber extraction fails, return empty dataframe (consistent with prior behavior)
