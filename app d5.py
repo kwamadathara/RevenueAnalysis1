@@ -281,24 +281,116 @@ def clean_text(text):
     return str(text).replace("\u00a0", " ").strip()
 
 
+def _normalize_columns(df, column_name_mapping, expected_headers):
+    """Detect header row, rename columns, and filter out signature/footer rows."""
+    df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
+    potential_header_row_index = -1
+    cleaned_cols = [' '.join(col.split()).strip() for col in df.columns]
+    matched_header_count = sum(1 for exp in expected_headers if any(re.search(exp.replace(' ', r'\s*'), c, re.IGNORECASE) for c in cleaned_cols))
+    if matched_header_count >= 3:
+        potential_header_row_index = 0
+    else:
+        for idx, row in df.iterrows():
+            row_values_str = ' '.join(row.astype(str).fillna('')).strip()
+            row_match = sum(1 for exp in expected_headers if re.search(exp.replace(' ', r'\s*'), row_values_str, re.IGNORECASE))
+            if row_match >= 3:
+                potential_header_row_index = idx
+                break
+    if potential_header_row_index == -1:
+        return pd.DataFrame()
+    if potential_header_row_index > 0:
+        header_row = df.iloc[potential_header_row_index]
+        df = df[potential_header_row_index + 1:].copy()
+        df.columns = header_row
+    df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
+    new_cols = []
+    for col in df.columns:
+        mapped = False
+        for pattern, new_name in column_name_mapping.items():
+            if re.search(pattern, col, re.IGNORECASE):
+                new_cols.append(new_name)
+                mapped = True
+                break
+        if not mapped:
+            new_cols.append(col)
+    df.columns = new_cols
+    df = df.loc[:, ~df.columns.str.contains('^Unnamed:', na=False)]
+    return df
+
+
+def _enrich_df(df, route_no, column_name_mapping, expected_headers):
+    """Add derived columns and filter footer rows."""
+    df = _normalize_columns(df, column_name_mapping, expected_headers)
+    if df.empty:
+        return df
+    if 'Consumer No.' in df.columns:
+        df['Consumer No.'] = df['Consumer No.'].astype(str).str.strip().str.replace(r'[\r\n\s]+', '', regex=True)
+        split_consumer = df['Consumer No.'].str.split(r'/', expand=True, n=2)
+        df['Area code'] = split_consumer[0].fillna('')
+        df['Consumer code'] = split_consumer[1].fillna('') if 1 in split_consumer.columns else ''
+        df['category'] = split_consumer[2].fillna('') if 2 in split_consumer.columns else ''
+        df['Primary key'] = df['Area code'] + df['Consumer code'] + df['category']
+    else:
+        df['Area code'] = ''
+        df['Consumer code'] = ''
+        df['category'] = ''
+        df['Primary key'] = ''
+    df['Route number'] = route_no
+    keywords_to_remove = ["meter reader", "meter inspector", "posting clerk", "kerala water authority"]
+    mask = df.apply(lambda row: not any(any(keyword in str(cell).lower() for cell in row) for keyword in keywords_to_remove), axis=1)
+    df = df[mask].copy()
+    for col in TEMPLATE_READING_SHEET_COLUMNS:
+        if col not in df.columns:
+            df[col] = ''
+    df = df[TEMPLATE_READING_SHEET_COLUMNS]
+    return df
+
+
 def parse_pdf_content(uploaded):
+    """
+    Parse a reading-sheet PDF and return (DataFrame, error_message).
+    error_message is None on success, or a human-readable string describing what went wrong.
+    """
     pdf_bytes = _buffer(uploaded)
     pdf_bytes.seek(0)
+
+    expected_headers = [
+        "SL. No.", "Consumer No.", "Phone No.", "Meter Number",
+        "Previous Reading Date", "Previous Reading", "Arrears",
+        "Current Reading", "Amount", "Remarks"
+    ]
+    column_name_mapping = {
+        r"SL\.?\s*No\.?": "SL. No.",
+        r"Consumer\s*No\.?": "Consumer No.",
+        r"Phone\s*No\.?": "Phone No.",
+        r"Meter\s*Number": "Meter Number",
+        r"Previous\s*Reading\s*Date": "Previous Reading Date",
+        r"Previous\s*Reading|Prev\.?\s*Reading|Last\s*Read": "Previous Reading",
+        r"Arrears": "Arrears",
+        r"Current\s*Reading": "Current Reading",
+        r"Amount|Payable": "Payable",
+        r"Remarks": "Remarks",
+        r"Bill\s*Issued": "Remarks",
+    }
+
+    # Step 1: Extract route number using pypdf
     route_no = None
+    full_text = ""
     try:
         reader = PdfReader(pdf_bytes)
-        if len(reader.pages) > 0:
-            first_page_text = reader.pages[0].extract_text()
-            if first_page_text:
-                route_match = re.search(r"Route\s*No\s*:\s*(\d+)", first_page_text, re.IGNORECASE)
-                if route_match:
-                    route_no = route_match.group(1)
-    except Exception:
-        pass
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            full_text += page_text + "\n"
+        route_match = re.search(r"Route\s*No\s*:\s*(\d+)", full_text, re.IGNORECASE)
+        if route_match:
+            route_no = route_match.group(1)
+    except Exception as e:
+        return pd.DataFrame(), f"pypdf failed to read the PDF: {e}"
 
-    # Use pdfplumber to extract tables from the PDF
+    # Step 2: Try pdfplumber table extraction
     pdf_bytes.seek(0)
     dfs = []
+    pdfplumber_error = None
     try:
         with pdfplumber.open(pdf_bytes) as pdf:
             for page in pdf.pages:
@@ -306,90 +398,50 @@ def parse_pdf_content(uploaded):
                 for table in tables or []:
                     if not table:
                         continue
-                    # table is a list of rows (lists); convert to DataFrame
                     df = pd.DataFrame(table)
-                    # Replace None with empty string and clean each cell
                     df = df.fillna('').astype(str).applymap(clean_text)
                     dfs.append(df)
-    except Exception:
-        # If pdfplumber extraction fails, return empty dataframe (consistent with prior behavior)
-        return pd.DataFrame()
+    except Exception as e:
+        pdfplumber_error = str(e)
 
-    if not dfs:
-        return pd.DataFrame()
+    # Step 3: If pdfplumber found tables, process them
+    if dfs:
+        combined_df = pd.DataFrame()
+        for df in dfs:
+            if df.empty:
+                continue
+            enriched = _enrich_df(df, route_no, column_name_mapping, expected_headers)
+            if not enriched.empty:
+                combined_df = pd.concat([combined_df, enriched], ignore_index=True)
+        if not combined_df.empty:
+            return combined_df, None
 
-    combined_df = pd.DataFrame()
-    for df in dfs:
-        if df.empty:
-            continue
-        # Keep the existing header detection and normalization logic
-        df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
-        expected_headers = ["SL. No.", "Consumer No.", "Phone No.", "Meter Number", "Previous Reading Date", "Previous Reading", "Arrears", "Current Reading", "Amount", "Remarks"]
-        column_name_mapping = {
-            r"SL\.?\s*No\.?": "SL. No.",
-            r"Consumer\s*No\.?": "Consumer No.",
-            r"Phone\s*No\.?": "Phone No.",
-            r"Meter\s*Number": "Meter Number",
-            r"Previous\s*Reading\s*Date": "Previous Reading Date",
-            r"Previous\s*Reading|Prev\.?\s*Reading|Last\s*Read": "Previous Reading",
-            r"Arrears": "Arrears",
-            r"Current\s*Reading": "Current Reading",
-            r"Amount|Payable": "Payable",
-            r"Remarks": "Remarks",
-            r"Bill\s*Issued": "Remarks",
-        }
-        potential_header_row_index = -1
-        cleaned_cols = [' '.join(col.split()).strip() for col in df.columns]
-        matched_header_count = sum(1 for exp in expected_headers if any(re.search(exp.replace(' ', r'\s*'), c, re.IGNORECASE) for c in cleaned_cols))
-        if matched_header_count >= 3:
-            potential_header_row_index = 0
-        else:
-            for idx, row in df.iterrows():
-                row_values_str = ' '.join(row.astype(str).fillna('')).strip()
-                row_match = sum(1 for exp in expected_headers if re.search(exp.replace(' ', r'\s*'), row_values_str, re.IGNORECASE))
-                if row_match >= 3:
-                    potential_header_row_index = idx
-                    break
-        if potential_header_row_index != -1:
-            if potential_header_row_index > 0:
-                header_row = df.iloc[potential_header_row_index]
-                df = df[potential_header_row_index + 1:].copy()
-                df.columns = header_row
-            df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
-            new_cols = []
-            for col in df.columns:
-                mapped = False
-                for pattern, new_name in column_name_mapping.items():
-                    if re.search(pattern, col, re.IGNORECASE):
-                        new_cols.append(new_name)
-                        mapped = True
-                        break
-                if not mapped:
-                    new_cols.append(col)
-            df.columns = new_cols
-            df = df.loc[:, ~df.columns.str.contains('^Unnamed:', na=False)]
-        if 'Consumer No.' in df.columns:
-            df['Consumer No.'] = df['Consumer No.'].astype(str).str.strip().str.replace(r'[\r\n\s]+', '', regex=True)
-            split_consumer = df['Consumer No.'].str.split(r'/', expand=True, n=2)
-            df['Area code'] = split_consumer[0].fillna('')
-            df['Consumer code'] = split_consumer[1].fillna('') if 1 in split_consumer.columns else ''
-            df['category'] = split_consumer[2].fillna('') if 2 in split_consumer.columns else ''
-            df['Primary key'] = df['Area code'] + df['Consumer code'] + df['category']
-        else:
-            df['Area code'] = ''
-            df['Consumer code'] = ''
-            df['category'] = ''
-            df['Primary key'] = ''
-        df['Route number'] = route_no
-        keywords_to_remove = ["meter reader", "meter inspector", "posting clerk", "kerala water authority"]
-        mask = df.apply(lambda row: not any(any(keyword in str(cell).lower() for cell in row) for keyword in keywords_to_remove), axis=1)
-        df = df[mask].copy()
-        for col in TEMPLATE_READING_SHEET_COLUMNS:
-            if col not in df.columns:
-                df[col] = ''
-        df = df[TEMPLATE_READING_SHEET_COLUMNS]
-        combined_df = pd.concat([combined_df, df], ignore_index=True)
-    return combined_df
+    # Step 4: Fallback — parse from raw text extracted by pypdf
+    # This handles scanned-text PDFs or cases where pdfplumber finds no table structure
+    if full_text.strip():
+        try:
+            lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+            rows = [re.split(r'\s{2,}', line) for line in lines]
+            max_cols = max((len(r) for r in rows), default=0)
+            if max_cols >= 3:
+                padded = [r + [''] * (max_cols - len(r)) for r in rows]
+                text_df = pd.DataFrame(padded)
+                text_df = text_df.fillna('').astype(str).applymap(clean_text)
+                enriched = _enrich_df(text_df, route_no, column_name_mapping, expected_headers)
+                if not enriched.empty:
+                    return enriched, None
+        except Exception as e:
+            pass
+
+    # Step 5: Determine the best error message to return
+    if pdfplumber_error:
+        return pd.DataFrame(), f"pdfplumber failed: {pdfplumber_error}"
+    if not full_text.strip():
+        return pd.DataFrame(), "PDF appears to be a scanned image (no selectable text found). Cannot extract data."
+    return pd.DataFrame(), (
+        f"No readable table found in the PDF (route {route_no or 'unknown'}). "
+        "The table borders may be invisible or the column headers do not match expected format."
+    )
 
 
 def process_bpl_df(bpl_sheet_df):
@@ -853,16 +905,21 @@ def main():
                         increment = 20 / total_pdfs
                         progress_value = 40
                         for idx, pdf in enumerate(reading_files, start=1):
-                            try:
-                                reading_dfs.append(parse_pdf_content(pdf))
-                            except Exception as e:
-                                st.warning(f"Failed to parse one of the reading PDFs: {e}")
+                            parsed_df, parse_error = parse_pdf_content(pdf)
+                            if parse_error:
+                                st.warning(f"⚠️ PDF '{pdf.name}': {parse_error}")
+                            if not parsed_df.empty:
+                                reading_dfs.append(parsed_df)
+                            else:
+                                st.warning(f"⚠️ PDF '{pdf.name}' produced no data rows. It will be skipped.")
                             progress_value += increment
                             update_progress(f"Parsing reading sheets ({idx}/{total_pdfs})", progress_value)
                     else:
                         update_progress("Parsing reading sheets", 60)
 
                     reading_df = pd.concat(reading_dfs, ignore_index=True) if reading_dfs else pd.DataFrame()
+                    if reading_df.empty:
+                        st.error("❌ No data could be extracted from any of the uploaded PDFs. Check the warnings above for details.")
 
                     update_progress("Processing BPL list", 75)
                     bpl_raw_df = read_data_file(bpl_file)
