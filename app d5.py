@@ -281,116 +281,23 @@ def clean_text(text):
     return str(text).replace("\u00a0", " ").strip()
 
 
-def _normalize_columns(df, column_name_mapping, expected_headers):
-    """Detect header row, rename columns, and filter out signature/footer rows."""
-    df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
-    potential_header_row_index = -1
-    cleaned_cols = [' '.join(col.split()).strip() for col in df.columns]
-    matched_header_count = sum(1 for exp in expected_headers if any(re.search(exp.replace(' ', r'\s*'), c, re.IGNORECASE) for c in cleaned_cols))
-    if matched_header_count >= 3:
-        potential_header_row_index = 0
-    else:
-        for idx, row in df.iterrows():
-            row_values_str = ' '.join(row.astype(str).fillna('')).strip()
-            row_match = sum(1 for exp in expected_headers if re.search(exp.replace(' ', r'\s*'), row_values_str, re.IGNORECASE))
-            if row_match >= 3:
-                potential_header_row_index = idx
-                break
-    if potential_header_row_index == -1:
-        return pd.DataFrame()
-    if potential_header_row_index > 0:
-        header_row = df.iloc[potential_header_row_index]
-        df = df[potential_header_row_index + 1:].copy()
-        df.columns = header_row
-    df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
-    new_cols = []
-    for col in df.columns:
-        mapped = False
-        for pattern, new_name in column_name_mapping.items():
-            if re.search(pattern, col, re.IGNORECASE):
-                new_cols.append(new_name)
-                mapped = True
-                break
-        if not mapped:
-            new_cols.append(col)
-    df.columns = new_cols
-    df = df.loc[:, ~df.columns.str.contains('^Unnamed:', na=False)]
-    return df
-
-
-def _enrich_df(df, route_no, column_name_mapping, expected_headers):
-    """Add derived columns and filter footer rows."""
-    df = _normalize_columns(df, column_name_mapping, expected_headers)
-    if df.empty:
-        return df
-    if 'Consumer No.' in df.columns:
-        df['Consumer No.'] = df['Consumer No.'].astype(str).str.strip().str.replace(r'[\r\n\s]+', '', regex=True)
-        split_consumer = df['Consumer No.'].str.split(r'/', expand=True, n=2)
-        df['Area code'] = split_consumer[0].fillna('')
-        df['Consumer code'] = split_consumer[1].fillna('') if 1 in split_consumer.columns else ''
-        df['category'] = split_consumer[2].fillna('') if 2 in split_consumer.columns else ''
-        df['Primary key'] = df['Area code'] + df['Consumer code'] + df['category']
-    else:
-        df['Area code'] = ''
-        df['Consumer code'] = ''
-        df['category'] = ''
-        df['Primary key'] = ''
-    df['Route number'] = route_no
-    keywords_to_remove = ["meter reader", "meter inspector", "posting clerk", "kerala water authority"]
-    mask = df.apply(lambda row: not any(any(keyword in str(cell).lower() for cell in row) for keyword in keywords_to_remove), axis=1)
-    df = df[mask].copy()
-    for col in TEMPLATE_READING_SHEET_COLUMNS:
-        if col not in df.columns:
-            df[col] = ''
-    df = df[TEMPLATE_READING_SHEET_COLUMNS]
-    return df
-
-
 def parse_pdf_content(uploaded):
-    """
-    Parse a reading-sheet PDF and return (DataFrame, error_message).
-    error_message is None on success, or a human-readable string describing what went wrong.
-    """
     pdf_bytes = _buffer(uploaded)
     pdf_bytes.seek(0)
-
-    expected_headers = [
-        "SL. No.", "Consumer No.", "Phone No.", "Meter Number",
-        "Previous Reading Date", "Previous Reading", "Arrears",
-        "Current Reading", "Amount", "Remarks"
-    ]
-    column_name_mapping = {
-        r"SL\.?\s*No\.?": "SL. No.",
-        r"Consumer\s*No\.?": "Consumer No.",
-        r"Phone\s*No\.?": "Phone No.",
-        r"Meter\s*Number": "Meter Number",
-        r"Previous\s*Reading\s*Date": "Previous Reading Date",
-        r"Previous\s*Reading|Prev\.?\s*Reading|Last\s*Read": "Previous Reading",
-        r"Arrears": "Arrears",
-        r"Current\s*Reading": "Current Reading",
-        r"Amount|Payable": "Payable",
-        r"Remarks": "Remarks",
-        r"Bill\s*Issued": "Remarks",
-    }
-
-    # Step 1: Extract route number using pypdf
     route_no = None
-    full_text = ""
     try:
         reader = PdfReader(pdf_bytes)
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            full_text += page_text + "\n"
-        route_match = re.search(r"Route\s*No\s*:\s*(\d+)", full_text, re.IGNORECASE)
-        if route_match:
-            route_no = route_match.group(1)
-    except Exception as e:
-        return pd.DataFrame(), f"pypdf failed to read the PDF: {e}"
+        if len(reader.pages) > 0:
+            first_page_text = reader.pages[0].extract_text()
+            if first_page_text:
+                route_match = re.search(r"Route\s*No\s*:\s*(\d+)", first_page_text, re.IGNORECASE)
+                if route_match:
+                    route_no = route_match.group(1)
+    except Exception:
+        pass
 
-    # Step 2: Try pdfplumber table extraction
     pdf_bytes.seek(0)
     dfs = []
-    pdfplumber_error = None
     try:
         with pdfplumber.open(pdf_bytes) as pdf:
             for page in pdf.pages:
@@ -399,49 +306,85 @@ def parse_pdf_content(uploaded):
                     if not table:
                         continue
                     df = pd.DataFrame(table)
-                    df = df.fillna('').astype(str).applymap(clean_text)
+                    df = df.fillna('').astype(str).map(clean_text)
                     dfs.append(df)
-    except Exception as e:
-        pdfplumber_error = str(e)
+    except Exception:
+        return pd.DataFrame()
 
-    # Step 3: If pdfplumber found tables, process them
-    if dfs:
-        combined_df = pd.DataFrame()
-        for df in dfs:
-            if df.empty:
-                continue
-            enriched = _enrich_df(df, route_no, column_name_mapping, expected_headers)
-            if not enriched.empty:
-                combined_df = pd.concat([combined_df, enriched], ignore_index=True)
-        if not combined_df.empty:
-            return combined_df, None
+    if not dfs:
+        return pd.DataFrame()
 
-    # Step 4: Fallback — parse from raw text extracted by pypdf
-    # This handles scanned-text PDFs or cases where pdfplumber finds no table structure
-    if full_text.strip():
-        try:
-            lines = [line.strip() for line in full_text.splitlines() if line.strip()]
-            rows = [re.split(r'\s{2,}', line) for line in lines]
-            max_cols = max((len(r) for r in rows), default=0)
-            if max_cols >= 3:
-                padded = [r + [''] * (max_cols - len(r)) for r in rows]
-                text_df = pd.DataFrame(padded)
-                text_df = text_df.fillna('').astype(str).applymap(clean_text)
-                enriched = _enrich_df(text_df, route_no, column_name_mapping, expected_headers)
-                if not enriched.empty:
-                    return enriched, None
-        except Exception as e:
-            pass
-
-    # Step 5: Determine the best error message to return
-    if pdfplumber_error:
-        return pd.DataFrame(), f"pdfplumber failed: {pdfplumber_error}"
-    if not full_text.strip():
-        return pd.DataFrame(), "PDF appears to be a scanned image (no selectable text found). Cannot extract data."
-    return pd.DataFrame(), (
-        f"No readable table found in the PDF (route {route_no or 'unknown'}). "
-        "The table borders may be invisible or the column headers do not match expected format."
-    )
+    combined_df = pd.DataFrame()
+    for df in dfs:
+        if df.empty:
+            continue
+        df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
+        expected_headers = ["SL. No.", "Consumer No.", "Phone No.", "Meter Number", "Previous Reading Date", "Previous Reading", "Arrears", "Current Reading", "Amount", "Remarks"]
+        column_name_mapping = {
+            r"SL\.?\s*No\.?": "SL. No.",
+            r"Consumer\s*No\.?": "Consumer No.",
+            r"Phone\s*No\.?": "Phone No.",
+            r"Meter\s*Number": "Meter Number",
+            r"Previous\s*Reading\s*Date": "Previous Reading Date",
+            r"Previous\s*Reading|Prev\.?\s*Reading|Last\s*Read": "Previous Reading",
+            r"Arrears": "Arrears",
+            r"Current\s*Reading": "Current Reading",
+            r"Amount|Payable": "Payable",
+            r"Remarks": "Remarks",
+            r"Bill\s*Issued": "Remarks",
+        }
+        potential_header_row_index = -1
+        cleaned_cols = [' '.join(col.split()).strip() for col in df.columns]
+        matched_header_count = sum(1 for exp in expected_headers if any(re.search(exp.replace(' ', r'\s*'), c, re.IGNORECASE) for c in cleaned_cols))
+        if matched_header_count >= 3:
+            potential_header_row_index = 0
+        else:
+            for idx, row in df.iterrows():
+                row_values_str = ' '.join(row.astype(str).fillna('')).strip()
+                row_match = sum(1 for exp in expected_headers if re.search(exp.replace(' ', r'\s*'), row_values_str, re.IGNORECASE))
+                if row_match >= 3:
+                    potential_header_row_index = idx
+                    break
+        if potential_header_row_index != -1:
+            if potential_header_row_index > 0:
+                header_row = df.iloc[potential_header_row_index]
+                df = df[potential_header_row_index + 1:].copy()
+                df.columns = header_row
+            df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
+            new_cols = []
+            for col in df.columns:
+                mapped = False
+                for pattern, new_name in column_name_mapping.items():
+                    if re.search(pattern, col, re.IGNORECASE):
+                        new_cols.append(new_name)
+                        mapped = True
+                        break
+                if not mapped:
+                    new_cols.append(col)
+            df.columns = new_cols
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed:', na=False)]
+        if 'Consumer No.' in df.columns:
+            df['Consumer No.'] = df['Consumer No.'].astype(str).str.strip().str.replace(r'[\r\n\s]+', '', regex=True)
+            split_consumer = df['Consumer No.'].str.split(r'/', expand=True, n=2)
+            df['Area code'] = split_consumer[0].fillna('')
+            df['Consumer code'] = split_consumer[1].fillna('') if 1 in split_consumer.columns else ''
+            df['category'] = split_consumer[2].fillna('') if 2 in split_consumer.columns else ''
+            df['Primary key'] = df['Area code'] + df['Consumer code'] + df['category']
+        else:
+            df['Area code'] = ''
+            df['Consumer code'] = ''
+            df['category'] = ''
+            df['Primary key'] = ''
+        df['Route number'] = route_no
+        keywords_to_remove = ["meter reader", "meter inspector", "posting clerk", "kerala water authority"]
+        mask = df.apply(lambda row: not any(any(keyword in str(cell).lower() for cell in row) for keyword in keywords_to_remove), axis=1)
+        df = df[mask].copy()
+        for col in TEMPLATE_READING_SHEET_COLUMNS:
+            if col not in df.columns:
+                df[col] = ''
+        df = df[TEMPLATE_READING_SHEET_COLUMNS]
+        combined_df = pd.concat([combined_df, df], ignore_index=True)
+    return combined_df
 
 
 def process_bpl_df(bpl_sheet_df):
@@ -614,7 +557,6 @@ def merge_billing_dates(billed_routes_df, consumer_df):
     billed_df = billed_routes_df.copy()
     sep_df = consumer_df.copy()
 
-    # Ensure billed template has expected columns; try to normalize if missing
     if 'Route Number' not in billed_df.columns or 'Billed Date' not in billed_df.columns:
         try:
             billed_df = extract_route_data(billed_df)
@@ -675,8 +617,6 @@ def calculate_usage_report(previous_df, current_df, save_name):
         'area code': ['area code', 'area_code', 'areacode'],
         'category': ['category', 'consumer category'],
         'Meter Reader Name': ['meter reader name', 'reader name', 'meter_reader_name', 'reader'],
-        'BPL_2024': ['bpl_2024', 'bpl 2024'],
-        'BPL_2025': ['bpl_2025', 'bpl 2025'],
         'Last Reading Date': ['last reading date', 'reading date', 'last_reading_date'],
         'Last Pay Date': ['last pay date', 'payment date', 'last_pay_date'],
         'Last Amount Paid': ['last amount paid', 'amount paid', 'last_amount_paid', 'payment amount'],
@@ -704,14 +644,98 @@ def calculate_usage_report(previous_df, current_df, save_name):
     merged['Usage'] = merged['Current_Reading'] - merged['Previous_Reading']
     merged = merged.dropna(subset=['Previous_Reading', 'Current_Reading'])
 
-    column_order = [
-        'Consumer_No', 'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
-        'Previous_Reading', 'Current_Reading', 'Usage', 'BPL_2024', 'BPL_2025',
+    # ============================================================
+    # Auto-detect BPL columns from current month file
+    # ============================================================
+    bpl_columns_in_file = [col for col in september_df.columns 
+                           if re.search(r'bpl[\s_-]*(\d{4})', str(col), re.IGNORECASE)]
+    
+    actual_bpl_cols = []  # Final list of BPL_<year> columns in merged df
+    if bpl_columns_in_file:
+        original_to_renamed = {}
+        for col in bpl_columns_in_file:
+            match = re.search(r'(\d{4})', str(col))
+            if match:
+                year = int(match.group(1))
+                original_to_renamed[col] = f'BPL_{year}'
+        
+        bpl_data = september_df[[september_consumer_col] + list(original_to_renamed.keys())].copy()
+        bpl_data = bpl_data.rename(columns={september_consumer_col: 'Consumer_No', **original_to_renamed})
+        merged = merged.merge(bpl_data, on='Consumer_No', how='left')
+        actual_bpl_cols = sorted([c for c in merged.columns 
+                                   if c.startswith('BPL_') and c[4:].isdigit()],
+                                  key=lambda x: int(x.split('_')[1]))
+
+    # ============================================================
+    # Single consolidated BPL Status column
+    # Logic: Pick the most recent year with an active BPL status
+    # ============================================================
+    def get_latest_active_bpl(row):
+        """
+        Returns 'BPL_<year>' only if the consumer is actively BPL in the
+        most recent year that has a valid BPL entry. Returns the actual
+        status value (e.g., 'APL', 'REMOVED') if the most recent status
+        is not active. Returns NaN if no BPL data exists at all.
+        """
+        valid_entries = []
+        for col in actual_bpl_cols:
+            year = int(col.split('_')[1])
+            val = row[col]
+            if pd.notna(val) and str(val).strip() != '' and str(val).strip().lower() != 'nan':
+                val_clean = str(val).strip().upper()
+                valid_entries.append((year, val_clean))
+        
+        if not valid_entries:
+            return pd.NA
+        
+        # Sort by year descending — pick the most recent
+        valid_entries.sort(key=lambda x: x[0], reverse=True)
+        latest_year, latest_status = valid_entries[0]
+        
+        # Active BPL check
+        active_indicators = {'BPL', 'YES', 'ACTIVE', '1', 'TRUE', 'Y', 'ENABLED'}
+        inactive_indicators = {'APL', 'NO', 'INACTIVE', '0', 'FALSE', 'N', 'DISABLED', 'REMOVED', 'NA', 'N/A'}
+        
+        if latest_status in active_indicators:
+            return f'BPL_{latest_year}'
+        elif latest_status in inactive_indicators:
+            return latest_status
+        else:
+            # Unknown value — return with year for transparency
+            return f'{latest_status}_{latest_year}'
+
+    if actual_bpl_cols:
+        merged['BPL Status'] = merged.apply(get_latest_active_bpl, axis=1)
+    else:
+        merged['BPL Status'] = pd.NA
+
+    # Add serial number column
+    merged = merged.reset_index(drop=True)
+    merged.insert(0, 'Sl. No.', range(1, len(merged) + 1))
+
+    # ============================================================
+    # Column order: Sl. No. → Consumer_No → BPL year columns → BPL Status → rest
+    # ============================================================
+    other_columns = [
+        'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
+        'Previous_Reading', 'Current_Reading', 'Usage',
         'Last Reading Date', 'Last Pay Date', 'Last Amount Paid', 'Arrears', 'Disconn. Date'
     ]
-    final_columns = [col for col in column_order if col in merged.columns]
-    result = merged[final_columns]
+    
+    final_columns = ['Sl. No.', 'Consumer_No']
+    final_columns.extend(actual_bpl_cols)  # Individual BPL_2023, BPL_2024, BPL_2025
+    final_columns.append('BPL Status')     # Consolidated status
+    final_columns.extend([c for c in other_columns if c in merged.columns])
+    
+    # Add any remaining columns defensively
+    remaining = [c for c in merged.columns if c not in final_columns]
+    final_columns.extend(remaining)
+    
+    result = merged[final_columns].copy()
 
+    # ============================================================
+    # Summary stats & Excel export
+    # ============================================================
     total_usage = result['Usage'].sum()
     avg_usage = result['Usage'].mean()
     max_usage = result['Usage'].max()
@@ -726,19 +750,32 @@ def calculate_usage_report(previous_df, current_df, save_name):
             'Consumers with Arrears': len(result[result['Arrears'] > 0])
         }
 
+    bpl_stats = {}
+    if 'BPL Status' in result.columns:
+        bpl_active_mask = result['BPL Status'].astype(str).str.startswith('BPL_', na=False)
+        bpl_stats = {
+            'Total Active BPL Consumers': int(bpl_active_mask.sum()),
+            'BPL Status Breakdown': result['BPL Status'].value_counts(dropna=False).to_dict()
+        }
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{save_name}_{timestamp}.xlsx"
     output_buffer = io.BytesIO()
 
     with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
         result.to_excel(writer, sheet_name='Usage_Calculation', index=False)
+        
         summary_metrics = ['Total Records', 'Total Usage', 'Average Usage', 'Maximum Usage', 'Minimum Usage']
         summary_values = [len(result), total_usage, avg_usage, max_usage, min_usage]
         if arrears_stats:
             summary_metrics.extend(arrears_stats.keys())
             summary_values.extend(arrears_stats.values())
+        if bpl_stats:
+            summary_metrics.append('Total Active BPL Consumers')
+            summary_values.append(bpl_stats['Total Active BPL Consumers'])
         summary_df = pd.DataFrame({'Metric': summary_metrics, 'Value': summary_values})
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
+        
         usage_categories = pd.DataFrame({
             'Category': ['0-100 units', '101-200 units', '201-500 units', '501+ units'],
             'Count': [
@@ -749,9 +786,15 @@ def calculate_usage_report(previous_df, current_df, save_name):
             ]
         })
         usage_categories.to_excel(writer, sheet_name='Usage_Categories', index=False)
+        
         high_usage = result[result['Usage'] > 500].copy()
         if not high_usage.empty:
             high_usage.sort_values('Usage', ascending=False).to_excel(writer, sheet_name='High_Usage_Consumers', index=False)
+        
+        # Active BPL consumers sheet
+        if bpl_stats and bpl_stats['Total Active BPL Consumers'] > 0:
+            bpl_active_df = result[result['BPL Status'].astype(str).str.startswith('BPL_', na=False)].copy()
+            bpl_active_df.to_excel(writer, sheet_name='Active_BPL_Consumers', index=False)
 
     output_buffer.seek(0)
 
@@ -762,6 +805,7 @@ def calculate_usage_report(previous_df, current_df, save_name):
         'max_usage': max_usage,
         'min_usage': min_usage,
         'arrears_stats': arrears_stats,
+        'bpl_stats': bpl_stats,
         'columns': final_columns,
         'file': output_buffer,
         'filename': filename
@@ -905,21 +949,16 @@ def main():
                         increment = 20 / total_pdfs
                         progress_value = 40
                         for idx, pdf in enumerate(reading_files, start=1):
-                            parsed_df, parse_error = parse_pdf_content(pdf)
-                            if parse_error:
-                                st.warning(f"⚠️ PDF '{pdf.name}': {parse_error}")
-                            if not parsed_df.empty:
-                                reading_dfs.append(parsed_df)
-                            else:
-                                st.warning(f"⚠️ PDF '{pdf.name}' produced no data rows. It will be skipped.")
+                            try:
+                                reading_dfs.append(parse_pdf_content(pdf))
+                            except Exception as e:
+                                st.warning(f"Failed to parse one of the reading PDFs: {e}")
                             progress_value += increment
                             update_progress(f"Parsing reading sheets ({idx}/{total_pdfs})", progress_value)
                     else:
                         update_progress("Parsing reading sheets", 60)
 
                     reading_df = pd.concat(reading_dfs, ignore_index=True) if reading_dfs else pd.DataFrame()
-                    if reading_df.empty:
-                        st.error("❌ No data could be extracted from any of the uploaded PDFs. Check the warnings above for details.")
 
                     update_progress("Processing BPL list", 75)
                     bpl_raw_df = read_data_file(bpl_file)
@@ -999,6 +1038,9 @@ def main():
                 if summary['arrears_stats']:
                     st.metric("Total Arrears", f"{summary['arrears_stats']['Total Arrears']:.2f}")
                     st.metric("Average Arrears", f"{summary['arrears_stats']['Average Arrears']:.2f}")
+
+                if summary.get('bpl_stats') and summary['bpl_stats'].get('Total Active BPL Consumers', 0) > 0:
+                    st.metric("Active BPL Consumers", f"{summary['bpl_stats']['Total Active BPL Consumers']}")
 
                 st.dataframe(result_df.head(20))
                 st.download_button(
