@@ -296,6 +296,7 @@ def parse_pdf_content(uploaded):
     except Exception:
         pass
 
+    # Use pdfplumber to extract tables from the PDF
     pdf_bytes.seek(0)
     dfs = []
     try:
@@ -305,10 +306,13 @@ def parse_pdf_content(uploaded):
                 for table in tables or []:
                     if not table:
                         continue
+                    # table is a list of rows (lists); convert to DataFrame
                     df = pd.DataFrame(table)
+                    # Replace None with empty string and clean each cell
                     df = df.fillna('').astype(str).map(clean_text)
                     dfs.append(df)
     except Exception:
+        # If pdfplumber extraction fails, return empty dataframe (consistent with prior behavior)
         return pd.DataFrame()
 
     if not dfs:
@@ -318,6 +322,7 @@ def parse_pdf_content(uploaded):
     for df in dfs:
         if df.empty:
             continue
+        # Keep the existing header detection and normalization logic
         df.columns = df.columns.astype(str).str.replace(r'[\r\n]+', ' ', regex=True).str.strip()
         expected_headers = ["SL. No.", "Consumer No.", "Phone No.", "Meter Number", "Previous Reading Date", "Previous Reading", "Arrears", "Current Reading", "Amount", "Remarks"]
         column_name_mapping = {
@@ -557,6 +562,7 @@ def merge_billing_dates(billed_routes_df, consumer_df):
     billed_df = billed_routes_df.copy()
     sep_df = consumer_df.copy()
 
+    # Ensure billed template has expected columns; try to normalize if missing
     if 'Route Number' not in billed_df.columns or 'Billed Date' not in billed_df.columns:
         try:
             billed_df = extract_route_data(billed_df)
@@ -630,8 +636,11 @@ def calculate_usage_report(previous_df, current_df, save_name):
         if found:
             found_columns[desired] = found
 
-    september_columns = [september_consumer_col, september_reading_col] + list(found_columns.values())
-    september_columns = [col for col in september_columns if col in september_df.columns]
+    # Dynamically collect all BPL_YYYY columns present in the current month data
+    bpl_cols_in_sep = [col for col in september_df.columns if re.match(r'^BPL_\d{4}$', col, re.IGNORECASE)]
+
+    september_columns = [september_consumer_col, september_reading_col] + list(found_columns.values()) + bpl_cols_in_sep
+    september_columns = list(dict.fromkeys(col for col in september_columns if col in september_df.columns))
     september_data = september_df[september_columns].copy()
 
     rename_map = {september_consumer_col: 'Consumer_No', september_reading_col: 'Current_Reading'}
@@ -644,98 +653,30 @@ def calculate_usage_report(previous_df, current_df, save_name):
     merged['Usage'] = merged['Current_Reading'] - merged['Previous_Reading']
     merged = merged.dropna(subset=['Previous_Reading', 'Current_Reading'])
 
-    # ============================================================
-    # Auto-detect BPL columns from current month file
-    # ============================================================
-    bpl_columns_in_file = [col for col in september_df.columns 
-                           if re.search(r'bpl[\s_-]*(\d{4})', str(col), re.IGNORECASE)]
-    
-    actual_bpl_cols = []  # Final list of BPL_<year> columns in merged df
-    if bpl_columns_in_file:
-        original_to_renamed = {}
-        for col in bpl_columns_in_file:
-            match = re.search(r'(\d{4})', str(col))
-            if match:
-                year = int(match.group(1))
-                original_to_renamed[col] = f'BPL_{year}'
-        
-        bpl_data = september_df[[september_consumer_col] + list(original_to_renamed.keys())].copy()
-        bpl_data = bpl_data.rename(columns={september_consumer_col: 'Consumer_No', **original_to_renamed})
-        merged = merged.merge(bpl_data, on='Consumer_No', how='left')
-        actual_bpl_cols = sorted([c for c in merged.columns 
-                                   if c.startswith('BPL_') and c[4:].isdigit()],
-                                  key=lambda x: int(x.split('_')[1]))
-
-    # ============================================================
-    # Single consolidated BPL Status column
-    # Logic: Pick the most recent year with an active BPL status
-    # ============================================================
-    def get_latest_active_bpl(row):
-        """
-        Returns 'BPL_<year>' only if the consumer is actively BPL in the
-        most recent year that has a valid BPL entry. Returns the actual
-        status value (e.g., 'APL', 'REMOVED') if the most recent status
-        is not active. Returns NaN if no BPL data exists at all.
-        """
-        valid_entries = []
-        for col in actual_bpl_cols:
-            year = int(col.split('_')[1])
-            val = row[col]
-            if pd.notna(val) and str(val).strip() != '' and str(val).strip().lower() != 'nan':
-                val_clean = str(val).strip().upper()
-                valid_entries.append((year, val_clean))
-        
-        if not valid_entries:
+    # Derive a single BPL Status from all BPL_YYYY columns, preferring the latest year
+    bpl_cols_in_merged = sorted(
+        [col for col in merged.columns if re.match(r'^BPL_\d{4}$', col, re.IGNORECASE)],
+        key=lambda x: int(re.search(r'\d{4}', x).group()),
+        reverse=True  # highest year first (e.g. 2026 before 2025 before 2024)
+    )
+    if bpl_cols_in_merged:
+        def _pick_latest_bpl(row):
+            for col in bpl_cols_in_merged:
+                val = row[col]
+                if pd.notna(val) and str(val).strip() not in ('', 'nan', 'None'):
+                    return val
             return pd.NA
-        
-        # Sort by year descending — pick the most recent
-        valid_entries.sort(key=lambda x: x[0], reverse=True)
-        latest_year, latest_status = valid_entries[0]
-        
-        # Active BPL check
-        active_indicators = {'BPL', 'YES', 'ACTIVE', '1', 'TRUE', 'Y', 'ENABLED'}
-        inactive_indicators = {'APL', 'NO', 'INACTIVE', '0', 'FALSE', 'N', 'DISABLED', 'REMOVED', 'NA', 'N/A'}
-        
-        if latest_status in active_indicators:
-            return f'BPL_{latest_year}'
-        elif latest_status in inactive_indicators:
-            return latest_status
-        else:
-            # Unknown value — return with year for transparency
-            return f'{latest_status}_{latest_year}'
+        merged['BPL Status'] = merged.apply(_pick_latest_bpl, axis=1)
+        merged.drop(columns=bpl_cols_in_merged, inplace=True)
 
-    if actual_bpl_cols:
-        merged['BPL Status'] = merged.apply(get_latest_active_bpl, axis=1)
-    else:
-        merged['BPL Status'] = pd.NA
-
-    # Add serial number column
-    merged = merged.reset_index(drop=True)
-    merged.insert(0, 'Sl. No.', range(1, len(merged) + 1))
-
-    # ============================================================
-    # Column order: Sl. No. → Consumer_No → BPL year columns → BPL Status → rest
-    # ============================================================
-    other_columns = [
-        'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
-        'Previous_Reading', 'Current_Reading', 'Usage',
+    column_order = [
+        'Consumer_No', 'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
+        'Previous_Reading', 'Current_Reading', 'Usage', 'BPL Status',
         'Last Reading Date', 'Last Pay Date', 'Last Amount Paid', 'Arrears', 'Disconn. Date'
     ]
-    
-    final_columns = ['Sl. No.', 'Consumer_No']
-    final_columns.extend(actual_bpl_cols)  # Individual BPL_2023, BPL_2024, BPL_2025
-    final_columns.append('BPL Status')     # Consolidated status
-    final_columns.extend([c for c in other_columns if c in merged.columns])
-    
-    # Add any remaining columns defensively
-    remaining = [c for c in merged.columns if c not in final_columns]
-    final_columns.extend(remaining)
-    
-    result = merged[final_columns].copy()
+    final_columns = [col for col in column_order if col in merged.columns]
+    result = merged[final_columns]
 
-    # ============================================================
-    # Summary stats & Excel export
-    # ============================================================
     total_usage = result['Usage'].sum()
     avg_usage = result['Usage'].mean()
     max_usage = result['Usage'].max()
@@ -750,32 +691,19 @@ def calculate_usage_report(previous_df, current_df, save_name):
             'Consumers with Arrears': len(result[result['Arrears'] > 0])
         }
 
-    bpl_stats = {}
-    if 'BPL Status' in result.columns:
-        bpl_active_mask = result['BPL Status'].astype(str).str.startswith('BPL_', na=False)
-        bpl_stats = {
-            'Total Active BPL Consumers': int(bpl_active_mask.sum()),
-            'BPL Status Breakdown': result['BPL Status'].value_counts(dropna=False).to_dict()
-        }
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{save_name}_{timestamp}.xlsx"
     output_buffer = io.BytesIO()
 
     with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
         result.to_excel(writer, sheet_name='Usage_Calculation', index=False)
-        
         summary_metrics = ['Total Records', 'Total Usage', 'Average Usage', 'Maximum Usage', 'Minimum Usage']
         summary_values = [len(result), total_usage, avg_usage, max_usage, min_usage]
         if arrears_stats:
             summary_metrics.extend(arrears_stats.keys())
             summary_values.extend(arrears_stats.values())
-        if bpl_stats:
-            summary_metrics.append('Total Active BPL Consumers')
-            summary_values.append(bpl_stats['Total Active BPL Consumers'])
         summary_df = pd.DataFrame({'Metric': summary_metrics, 'Value': summary_values})
         summary_df.to_excel(writer, sheet_name='Summary', index=False)
-        
         usage_categories = pd.DataFrame({
             'Category': ['0-100 units', '101-200 units', '201-500 units', '501+ units'],
             'Count': [
@@ -786,15 +714,9 @@ def calculate_usage_report(previous_df, current_df, save_name):
             ]
         })
         usage_categories.to_excel(writer, sheet_name='Usage_Categories', index=False)
-        
         high_usage = result[result['Usage'] > 500].copy()
         if not high_usage.empty:
             high_usage.sort_values('Usage', ascending=False).to_excel(writer, sheet_name='High_Usage_Consumers', index=False)
-        
-        # Active BPL consumers sheet
-        if bpl_stats and bpl_stats['Total Active BPL Consumers'] > 0:
-            bpl_active_df = result[result['BPL Status'].astype(str).str.startswith('BPL_', na=False)].copy()
-            bpl_active_df.to_excel(writer, sheet_name='Active_BPL_Consumers', index=False)
 
     output_buffer.seek(0)
 
@@ -805,7 +727,6 @@ def calculate_usage_report(previous_df, current_df, save_name):
         'max_usage': max_usage,
         'min_usage': min_usage,
         'arrears_stats': arrears_stats,
-        'bpl_stats': bpl_stats,
         'columns': final_columns,
         'file': output_buffer,
         'filename': filename
@@ -1038,9 +959,6 @@ def main():
                 if summary['arrears_stats']:
                     st.metric("Total Arrears", f"{summary['arrears_stats']['Total Arrears']:.2f}")
                     st.metric("Average Arrears", f"{summary['arrears_stats']['Average Arrears']:.2f}")
-
-                if summary.get('bpl_stats') and summary['bpl_stats'].get('Total Active BPL Consumers', 0) > 0:
-                    st.metric("Active BPL Consumers", f"{summary['bpl_stats']['Total Active BPL Consumers']}")
 
                 st.dataframe(result_df.head(20))
                 st.download_button(
