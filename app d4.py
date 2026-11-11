@@ -623,8 +623,6 @@ def calculate_usage_report(previous_df, current_df, save_name):
         'area code': ['area code', 'area_code', 'areacode'],
         'category': ['category', 'consumer category'],
         'Meter Reader Name': ['meter reader name', 'reader name', 'meter_reader_name', 'reader'],
-        'BPL_2024': ['bpl_2024', 'bpl 2024'],
-        'BPL_2025': ['bpl_2025', 'bpl 2025'],
         'Last Reading Date': ['last reading date', 'reading date', 'last_reading_date'],
         'Last Pay Date': ['last pay date', 'payment date', 'last_pay_date'],
         'Last Amount Paid': ['last amount paid', 'amount paid', 'last_amount_paid', 'payment amount'],
@@ -638,8 +636,11 @@ def calculate_usage_report(previous_df, current_df, save_name):
         if found:
             found_columns[desired] = found
 
-    september_columns = [september_consumer_col, september_reading_col] + list(found_columns.values())
-    september_columns = [col for col in september_columns if col in september_df.columns]
+    # Dynamically collect all BPL_YYYY columns present in the current month data
+    bpl_cols_in_sep = [col for col in september_df.columns if re.match(r'^BPL_\d{4}$', col, re.IGNORECASE)]
+
+    september_columns = [september_consumer_col, september_reading_col] + list(found_columns.values()) + bpl_cols_in_sep
+    september_columns = list(dict.fromkeys(col for col in september_columns if col in september_df.columns))
     september_data = september_df[september_columns].copy()
 
     rename_map = {september_consumer_col: 'Consumer_No', september_reading_col: 'Current_Reading'}
@@ -652,11 +653,44 @@ def calculate_usage_report(previous_df, current_df, save_name):
     merged['Usage'] = merged['Current_Reading'] - merged['Previous_Reading']
     merged = merged.dropna(subset=['Previous_Reading', 'Current_Reading'])
 
-    column_order = [
-        'Consumer_No', 'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
-        'Previous_Reading', 'Current_Reading', 'Usage', 'BPL_2024', 'BPL_2025',
-        'Last Reading Date', 'Last Pay Date', 'Last Amount Paid', 'Arrears', 'Disconn. Date'
-    ]
+    # BPL output: 3 explicit columns:
+    #   1. 'BPL Status'      - direct value from the latest year column in the data
+    #   2. 'BPL_<curr_year>' - current calendar year value (e.g. BPL_2026)
+    #   3. 'BPL_<prev_year>' - previous calendar year value (e.g. BPL_2025)
+    _now_year = datetime.now().year
+    _curr_bpl_col = f'BPL_{_now_year}'       # e.g. BPL_2026
+    _prev_bpl_col = f'BPL_{_now_year - 1}'   # e.g. BPL_2025
+
+    bpl_cols_in_merged = sorted(
+        [col for col in merged.columns if re.match(r'^BPL_\d{4}$', col, re.IGNORECASE)],
+        key=lambda x: int(re.search(r'\d{4}', x).group()),
+        reverse=True  # highest year first
+    )
+    bpl_output_cols = []  # ordered BPL columns to include in the output
+    if bpl_cols_in_merged:
+        # 1. BPL Status - direct value from the latest year column in the data
+        latest_bpl_col = bpl_cols_in_merged[0]
+        merged['BPL Status'] = merged[latest_bpl_col]
+        bpl_output_cols.append('BPL Status')
+
+        # 2. Current calendar year column (always shown separately if present)
+        if _curr_bpl_col in merged.columns:
+            bpl_output_cols.append(_curr_bpl_col)
+
+        # 3. Previous calendar year column (always shown separately if present)
+        if _prev_bpl_col in merged.columns:
+            bpl_output_cols.append(_prev_bpl_col)
+
+        # Drop all other BPL_* columns not in the output list
+        cols_to_drop = [c for c in bpl_cols_in_merged if c not in bpl_output_cols]
+        merged.drop(columns=cols_to_drop, inplace=True)
+
+    column_order = (
+        ['Consumer_No', 'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
+         'Previous_Reading', 'Current_Reading', 'Usage']
+        + bpl_output_cols
+        + ['Last Reading Date', 'Last Pay Date', 'Last Amount Paid', 'Arrears', 'Disconn. Date']
+    )
     final_columns = [col for col in column_order if col in merged.columns]
     result = merged[final_columns]
 
