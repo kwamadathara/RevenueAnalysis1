@@ -653,12 +653,13 @@ def calculate_usage_report(previous_df, current_df, save_name):
     merged['Usage'] = merged['Current_Reading'] - merged['Previous_Reading']
     merged = merged.dropna(subset=['Previous_Reading', 'Current_Reading'])
 
-    # Derive a single BPL Status from all BPL_YYYY columns, preferring the latest year
+    # Derive BPL Status (latest year) and retain the previous two years as separate columns
     bpl_cols_in_merged = sorted(
         [col for col in merged.columns if re.match(r'^BPL_\d{4}$', col, re.IGNORECASE)],
         key=lambda x: int(re.search(r'\d{4}', x).group()),
-        reverse=True  # highest year first (e.g. 2026 before 2025 before 2024)
+        reverse=True  # highest year first (e.g. 2026 -> 2025 -> 2024)
     )
+    bpl_output_cols = []  # ordered BPL columns to include in the output
     if bpl_cols_in_merged:
         def _pick_latest_bpl(row):
             for col in bpl_cols_in_merged:
@@ -667,13 +668,22 @@ def calculate_usage_report(previous_df, current_df, save_name):
                     return val
             return pd.NA
         merged['BPL Status'] = merged.apply(_pick_latest_bpl, axis=1)
-        merged.drop(columns=bpl_cols_in_merged, inplace=True)
+        bpl_output_cols.append('BPL Status')
 
-    column_order = [
-        'Consumer_No', 'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
-        'Previous_Reading', 'Current_Reading', 'Usage', 'BPL Status',
-        'Last Reading Date', 'Last Pay Date', 'Last Amount Paid', 'Arrears', 'Disconn. Date'
-    ]
+        # Keep previous two years' columns if present (positions 1 and 2 in desc-sorted list)
+        for prev_col in bpl_cols_in_merged[1:3]:
+            bpl_output_cols.append(prev_col)
+
+        # Drop any remaining BPL_* columns not being kept in output
+        cols_to_drop = [c for c in bpl_cols_in_merged if c not in bpl_output_cols]
+        merged.drop(columns=cols_to_drop, inplace=True)
+
+    column_order = (
+        ['Consumer_No', 'Address', 'Phone', 'Route', 'area code', 'category', 'Meter Reader Name',
+         'Previous_Reading', 'Current_Reading', 'Usage']
+        + bpl_output_cols
+        + ['Last Reading Date', 'Last Pay Date', 'Last Amount Paid', 'Arrears', 'Disconn. Date']
+    )
     final_columns = [col for col in column_order if col in merged.columns]
     result = merged[final_columns]
 
