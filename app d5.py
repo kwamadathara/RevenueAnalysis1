@@ -653,8 +653,10 @@ def calculate_usage_report(previous_df, current_df, save_name):
     merged['Usage'] = merged['Current_Reading'] - merged['Previous_Reading']
     merged = merged.dropna(subset=['Previous_Reading', 'Current_Reading'])
 
-    # BPL Status = value from the highest-year BPL column present in the data
-    # Also keep current calendar year and previous calendar year columns if available
+    # BPL output: 3 explicit columns:
+    #   1. 'BPL Status'      - direct value from the latest year column in the data
+    #   2. 'BPL_<curr_year>' - current calendar year value (e.g. BPL_2026)
+    #   3. 'BPL_<prev_year>' - previous calendar year value (e.g. BPL_2025)
     _now_year = datetime.now().year
     _curr_bpl_col = f'BPL_{_now_year}'       # e.g. BPL_2026
     _prev_bpl_col = f'BPL_{_now_year - 1}'   # e.g. BPL_2025
@@ -666,17 +668,17 @@ def calculate_usage_report(previous_df, current_df, save_name):
     )
     bpl_output_cols = []  # ordered BPL columns to include in the output
     if bpl_cols_in_merged:
-        # BPL Status is the direct value from the latest year column in the data
+        # 1. BPL Status - direct value from the latest year column in the data
         latest_bpl_col = bpl_cols_in_merged[0]
         merged['BPL Status'] = merged[latest_bpl_col]
         bpl_output_cols.append('BPL Status')
 
-        # Keep current calendar year column if present and not already the latest
-        if _curr_bpl_col in merged.columns and _curr_bpl_col != latest_bpl_col:
+        # 2. Current calendar year column (always shown separately if present)
+        if _curr_bpl_col in merged.columns:
             bpl_output_cols.append(_curr_bpl_col)
 
-        # Keep previous calendar year column if present
-        if _prev_bpl_col in merged.columns and _prev_bpl_col != latest_bpl_col:
+        # 3. Previous calendar year column (always shown separately if present)
+        if _prev_bpl_col in merged.columns:
             bpl_output_cols.append(_prev_bpl_col)
 
         # Drop all other BPL_* columns not in the output list
